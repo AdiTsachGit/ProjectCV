@@ -23,6 +23,7 @@ import os
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
+import atexit
 
 import accelerate
 import datasets
@@ -42,18 +43,25 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
-from transformers import CLIPModel
-
+from transformers import CLIPVisionModel, CLIPVisionModelWithProjection, CLIPTextModel, CLIPTokenizer, CLIPFeatureExtractor, CLIPImageProcessor 
+from PIL import Image
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel, StableDiffusionImg2ImgPipeline, PaintByExamplePipeline
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.pipelines.paint_by_example import PaintByExampleImageEncoder
+import sys
 
+atexit.register(logging.shutdown)
+
+
+# caution: path[0] is reserved for script path (or '' in REPL)
+sys.path.insert(1, '/home/adi.tsach/diffusers/src/diffusers/pipelines/stable_diffusion/')
+from pipeline_stable_diffusion_instruct_pix2pix_image import StableDiffusionInstructPix2PixImagePipeline
 
 if is_wandb_available():
     import wandb
@@ -64,10 +72,55 @@ check_min_version("0.30.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 DATASET_NAME_MAPPING = {
-    "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
+    "ADT1999/project_from_PIPE_extended": ("original_image", "target_image", "object_image"),
 }
-WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
+WANDB_TABLE_COL_NAMES = ["original_image", "target_image", "object_image"]
+# WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
 
+class LayerNorm(nn.LayerNorm):
+    """
+    Implementation that supports fp16 inputs but fp32 gains/biases.
+    """
+
+    def forward(self, x: torch.Tensor):
+        return super().forward(x.float()).to(x.dtype)
+
+
+class EmbeddingOptimizer(torch.nn.Module):
+    def __init__(self, input_dim=1024, output_dim=768, input_seq_len=257, output_seq_len=77):
+        super(EmbeddingOptimizer, self).__init__()
+        self.projection_layer = torch.nn.Linear(input_dim, output_dim)
+        self.attention_pooling = torch.nn.MultiheadAttention(output_dim, num_heads=8, batch_first=True)
+        self.mlp_fc1 = torch.nn.Linear(output_dim, output_dim)
+        self.mlp_relu = torch.nn.ReLU()
+        self.mlp_fc2 = torch.nn.Linear(output_dim, output_dim)
+        self.mlp_relu = torch.nn.ReLU()
+        self.mlp_fc3 = torch.nn.Linear(output_dim, output_dim)
+        self.mlp_relu = torch.nn.ReLU()
+        self.mlp_fc4 = torch.nn.Linear(output_dim, output_dim)
+
+        self.output_seq_len = output_seq_len
+        self.input_seq_len = input_seq_len
+
+    def forward(self, x):
+        # Step 1: Project input embeddings from 1024 to 768 dimensions
+        x = self.projection_layer(x)  # Shape: [batch_size, 257, 768]
+
+        # Step 2: Attention pooling to reduce sequence length from 257 to 77
+        # Create a query tensor for pooling: [batch_size, 77, 768]
+        query = torch.randn(x.size(0), self.output_seq_len, x.size(-1), device=x.device, dtype=x.dtype)
+        x, _ = self.attention_pooling(query, x, x)
+
+        # Step 3: Apply the MLP block for further refinement
+        x = self.mlp_fc1(x)
+        x = self.mlp_relu(x)
+        x = self.mlp_fc2(x)
+        x = self.mlp_relu(x)
+        x = self.mlp_fc3(x)
+        x = self.mlp_relu(x)
+        x = self.mlp_fc4(x)
+
+        return x
 
 def log_validation(
     pipeline,
@@ -76,7 +129,7 @@ def log_validation(
     generator,
 ):
     logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+        f"Running validation... \n Generating {args.num_validation_images} images with image:"
         f" {args.validation_prompt}."
     )
     pipeline = pipeline.to(accelerator.device)
@@ -84,7 +137,8 @@ def log_validation(
 
     # run inference
     original_image = download_image(args.val_image_url)
-    edited_images = []
+    object_image =  download_image(args.val_image_url2)
+    target_images = []
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
@@ -92,9 +146,9 @@ def log_validation(
 
     with autocast_ctx:
         for _ in range(args.num_validation_images):
-            edited_images.append(
+            target_images.append(
                 pipeline(
-                    args.validation_prompt,
+                    ob_image=object_image,
                     image=original_image,
                     num_inference_steps=20,
                     image_guidance_scale=1.5,
@@ -106,8 +160,8 @@ def log_validation(
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
             wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
-            for edited_image in edited_images:
-                wandb_table.add_data(wandb.Image(original_image), wandb.Image(edited_image), args.validation_prompt)
+            for target_image in target_images:
+                wandb_table.add_data(wandb.Image(original_image), wandb.Image(target_image), wandb.Image(object_image))
             tracker.log({"validation": wandb_table})
 
 
@@ -162,19 +216,19 @@ def parse_args():
     parser.add_argument(
         "--original_image_column",
         type=str,
-        default="input_image",
+        default="original_image",
         help="The column of the dataset containing the original image on which edits where made.",
     )
     parser.add_argument(
-        "--edited_image_column",
+        "--target_image_column",
         type=str,
-        default="edited_image",
-        help="The column of the dataset containing the edited image.",
+        default="target_image",
+        help="The column of the dataset containing the target image.",
     )
     parser.add_argument(
-        "--edit_prompt_column",
+        "--object_image_column",
         type=str,
-        default="edit_prompt",
+        default="object_image",
         help="The column of the dataset containing the edit instruction.",
     )
     parser.add_argument(
@@ -184,7 +238,10 @@ def parse_args():
         help="URL to the original image that you would like to edit (used during inference for debugging purposes).",
     )
     parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
+        "--val_image_url2",
+        type=str,
+        default=None,
+        help="URL to the object image that you would like to use for edit (used during inference for debugging purposes).",
     )
     parser.add_argument(
         "--num_validation_images",
@@ -213,7 +270,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="instruct-pix2pix-model",
+        default="instruct-pix2pix-model-final",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -226,7 +283,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=256,
+        default=224,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -403,7 +460,6 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
@@ -426,6 +482,8 @@ def download_image(url):
     return image
 
 
+
+
 def main():
     args = parse_args()
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -443,7 +501,10 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    logging_dir = os.path.abspath(os.path.join(args.output_dir, args.logging_dir))
+
+    os.makedirs(logging_dir, exist_ok=True)
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -458,13 +519,16 @@ def main():
 
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    # Make one log on every process with the configuration for debugging.
+    #  Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info(accelerator.state, main_process_only=False)
+    
+
+    #logger.info(accelerator.state, main_process_only=False)
+    logger.info(accelerator.state, main_process_only=True)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -489,26 +553,25 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained("paint-by-inpaint/add-base", subfolder="scheduler")
 
-    ####tokenizer = CLIPTokenizer.from_pretrained(
-    ####    args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    ####)
-
-    ####text_encoder = CLIPTextModel.from_pretrained(
-    ####    args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    ####)
-
-    image_encoder = CLIPModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="image_encoder", revision=args.revision, variant=args.variant
-    )
-
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
 
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        "paint-by-inpaint/add-base", subfolder="vae", revision=args.revision, variant=args.variant
     )
+    
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        "paint-by-inpaint/add-base", subfolder="unet", revision=args.non_ema_revision
+    )
+
+    feature_extractor = CLIPImageProcessor.from_pretrained("paint-by-inpaint/add-base", subfolder="feature_extractor", do_rescale=False)
+
+    embedding_optimizer = EmbeddingOptimizer(
+        input_dim=1024,    # The input dimension (from your image encoder)
+        output_dim=768,    # The desired output dimension (for the UNet cross-attention)
+        input_seq_len=257, # The input sequence length (from your image encoder)
+        output_seq_len=77  # The target sequence length (for Stable Diffusion's context length)
     )
 
     # InstructPix2Pix uses an additional image for conditioning. To accommodate that,
@@ -526,13 +589,23 @@ def main():
             in_channels, out_channels, unet.conv_in.kernel_size, unet.conv_in.stride, unet.conv_in.padding
         )
         new_conv_in.weight.zero_()
-        new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
+        new_conv_in.weight[:, :8, :, :].copy_(unet.conv_in.weight)
         unet.conv_in = new_conv_in
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
-    ####text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+    for name, param in unet.named_parameters():
+        if "cross_attention" in name.lower():
+            # Select specific blocks to train based on resolution
+            if "down_blocks.4" in name or "mid_block" in name or "up_blocks.0" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
+
+    # text_encoder.requires_grad_(False)
+    embedding_optimizer.requires_grad_(True)
     image_encoder.requires_grad_(False)
 
     # Create EMA for the unet.
@@ -619,13 +692,23 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    cross_attention_params = [
+    param for name, param in unet.named_parameters()
+    if "cross_attention" in name.lower() and (
+        "down_blocks.4" in name or "mid_block" in name or "up_blocks.0" in name
+    )
+]
+
     optimizer = optimizer_cls(
-        unet.parameters(),
-        lr=args.learning_rate,
+        [
+            {"params": embedding_optimizer.parameters(), "lr": args.learning_rate},  # Default learning rate
+            {"params": cross_attention_params, "lr": args.learning_rate * 0.1},  # Smaller LR for cross-attention
+        ],
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -650,89 +733,108 @@ def main():
         )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/main/en/image_load#imagefolder
-
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
     column_names = dataset["train"].column_names
-
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.original_image_column is None:
-        original_image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+    if args.object_image_column is None:
+        original_image_column = dataset_columns[0] if dataset_columns is not None else column_names[2]
+        print("orignal col: ",original_image_column)
     else:
         original_image_column = args.original_image_column
+        print("wird orignal col: ",original_image_column)
         if original_image_column not in column_names:
             raise ValueError(
                 f"--original_image_column' value '{args.original_image_column}' needs to be one of: {', '.join(column_names)}"
             )
-    if args.edit_prompt_column is None:
-        edit_prompt_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    if args.object_image_column is None:
+        object_image_column = dataset_columns[1] if dataset_columns is not None else column_names[3]
+        print("object col: ",object_image_column)
     else:
-        edit_prompt_column = args.edit_prompt_column
-        if edit_prompt_column not in column_names:
+        object_image_column = args.object_image_column
+        print("weird object col: ",object_image_column)
+        if object_image_column not in column_names:
             raise ValueError(
-                f"--edit_prompt_column' value '{args.edit_prompt_column}' needs to be one of: {', '.join(column_names)}"
+                f"--object_image_column' value '{args.object_image_column}' needs to be one of: {', '.join(column_names)}"
             )
-    if args.edited_image_column is None:
-        edited_image_column = dataset_columns[2] if dataset_columns is not None else column_names[2]
+    if args.target_image_column is None:
+        target_image_column = dataset_columns[2] if dataset_columns is not None else column_names[5]
+        print("target col: ",target_image_column)
     else:
-        edited_image_column = args.edited_image_column
-        if edited_image_column not in column_names:
+        target_image_column = args.target_image_column
+        print("weird target col: ",target_image_column)
+        if target_image_column not in column_names:
             raise ValueError(
-                f"--edited_image_column' value '{args.edited_image_column}' needs to be one of: {', '.join(column_names)}"
+                f"--target_image_column' value '{args.target_image_column}' needs to be one of: {', '.join(column_names)}"
             )
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    #### def tokenize_captions(captions):
-    ####    inputs = tokenizer(
-    ####        captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-    ####)
-    #### return inputs.input_ids
 
     # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-        ]
-    )
+    train_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(size=args.resolution, scale=(0.9, 1.0)),  # Random crop and resize
+        transforms.RandomHorizontalFlip(p=0.5),                                # Random horizontal flip
+        #transforms.ColorJitter(brightness=0.1, contrast=0.1),  # Color jitter
+    ])
 
+    
+
+
+        
     def preprocess_images(examples):
+    # Standard preprocessing for original and target images
         original_images = np.concatenate(
             [convert_to_np(image, args.resolution) for image in examples[original_image_column]]
         )
-        edited_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples[edited_image_column]]
+        target_images = np.concatenate(
+            [convert_to_np(image, args.resolution) for image in examples[target_image_column]]
         )
-        # We need to ensure that the original and the edited images undergo the same
-        # augmentation transforms.
-        images = np.concatenate([original_images, edited_images])
+
+
+    # CLIP-specific preprocessing for object images (conditioning)
+        
+        object_transforms = transforms.Compose([
+            transforms.Resize(size=(224,224)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=20),
+            transforms.ElasticTransform(),
+        ])
+        
+        object_images = [
+            object_transforms(feature_extractor(images=image, return_tensors="pt").pixel_values.squeeze(0))
+            for image in examples[object_image_column]
+        ]
+
+
+        object_images = torch.stack(object_images)
+        images = np.concatenate([original_images, target_images])
         images = torch.tensor(images)
         images = 2 * (images / 255) - 1
-        return train_transforms(images)
+     
+    # Normalize original and target images to [-1, 1] for VAE input
 
+
+        return train_transforms(images), object_images
+
+
+        
     def preprocess_train(examples):
-        # Preprocess images.
-        preprocessed_images = preprocess_images(examples)
-        # Since the original and edited images were concatenated before
-        # applying the transformations, we need to separate them and reshape
-        # them accordingly.
-        original_images, edited_images = preprocessed_images.chunk(2)
+    # Apply preprocessing
+        preprocessed_images, object_images = preprocess_images(examples)
+        original_images, target_images = preprocessed_images.chunk(2)
+    # Reshape and collate the images
         original_images = original_images.reshape(-1, 3, args.resolution, args.resolution)
-        edited_images = edited_images.reshape(-1, 3, args.resolution, args.resolution)
+        target_images = target_images.reshape(-1, 3, args.resolution, args.resolution)
 
-        # Collate the preprocessed images into the `examples`.
+    # Store the preprocessed images in the examples dictionary
         examples["original_pixel_values"] = original_images
-        examples["edited_pixel_values"] = edited_images
+        examples["target_pixel_values"] = target_images
+        examples["object_pixel_values"] = object_images
 
-        examples["example_image_pixel_values"] = example_images
-
-
-        # Preprocess the captions.
-        ####captions = list(examples[edit_prompt_column])
-        ####examples["input_ids"] = tokenize_captions(captions)
         return examples
+
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
@@ -743,14 +845,18 @@ def main():
     def collate_fn(examples):
         original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
         original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
-        edited_pixel_values = torch.stack([example["edited_pixel_values"] for example in examples])
-        edited_pixel_values = edited_pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
+        target_pixel_values = torch.stack([example["target_pixel_values"] for example in examples])
+        target_pixel_values = target_pixel_values.to(memory_format=torch.contiguous_format).float()
+        # input_ids = torch.stack([example["input_ids"] for example in examples])
+        object_pixel_values = torch.stack([example["object_pixel_values"] for example in examples])
+        object_pixel_values = object_pixel_values.to(memory_format=torch.contiguous_format).float()
         return {
             "original_pixel_values": original_pixel_values,
-            "edited_pixel_values": edited_pixel_values,
-            "input_ids": input_ids,
+            "target_pixel_values": target_pixel_values,
+            # "input_ids": input_ids,
+            "object_pixel_values": object_pixel_values
         }
+    
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -779,6 +885,7 @@ def main():
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
+    # torch.cuda.empty_cache()
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -792,10 +899,11 @@ def main():
         weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu and cast to weight_dtype
-    #### text_encoder.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     vae.to(accelerator.device, dtype=weight_dtype)
+    embedding_optimizer.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -850,7 +958,6 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
@@ -862,10 +969,10 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):
-                # We want to learn the denoising process w.r.t the edited images which
+                # We want to learn the denoising process w.r.t the mask images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
                 # So, first, convert images to latent space.
-                latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
+                latents = vae.encode(batch["target_pixel_values"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -879,10 +986,13 @@ def main():
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning.
-                ####encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = image_encoder(pixel_values= batch["object_pixel_values"]).last_hidden_state
+                encoder_hidden_states = embedding_optimizer(encoder_hidden_states)
 
-                encoder_hidden_states = image_encoder.get_image_features(pixel_values=batch["example_image_pixel_values"])
+                # Get the null conditioning using a blank image
+                blank_image_tensor = torch.zeros((args.train_batch_size, 3, 224, 224), device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
+                null_conditioning = image_encoder(blank_image_tensor).last_hidden_state  # Shape: [batch_size, hidden_dim]
+                null_conditioning = embedding_optimizer(null_conditioning)
 
 
                 # Get the additional image embedding for conditioning.
@@ -894,17 +1004,11 @@ def main():
                 if args.conditioning_dropout_prob is not None:
                     random_p = torch.rand(bsz, device=latents.device, generator=generator)
                     # Sample masks for the edit prompts.
-                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob
-                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-                    # Final text conditioning.
-                    #### null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
-                    #### encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
+                    object_mask = random_p < 2 * args.conditioning_dropout_prob
+                    object_mask = object_mask.reshape(bsz, 1, 1)
 
-                    # Create a blank image tensor
-                    blank_image_tensor = torch.zeros((3, args.resolution, args.resolution), device=accelerator.device)
-                    # Compute the null conditioning using the blank image
-                    null_conditioning = image_encoder.get_image_features(pixel_values=blank_image_tensor.unsqueeze(0))[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
+                    encoder_hidden_states = torch.where(object_mask, null_conditioning, encoder_hidden_states)
+                    
 
                     # Sample masks for the original images.
                     image_mask_dtype = original_image_embeds.dtype
@@ -930,18 +1034,25 @@ def main():
                 # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
+                
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate`
-                # accelerator.backward(loss)
-                # if accelerator.sync_gradients:
-                #     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                # optimizer.step()
-                # lr_scheduler.step()
-                # optimizer.zero_grad()
+                accelerator.backward(loss)
+                # Apply gradient clipping based on mixed precision
+                accelerator.clip_grad_norm_(embedding_optimizer.parameters(), args.max_grad_norm)
+                cross_attention_params = [
+                    param for name, param in unet.named_parameters()
+                    if "cross_attention" in name.lower() and (
+                        "down_blocks.4" in name or "mid_block" in name or "up_blocks.0" in name
+                    )
+                ]
+                accelerator.clip_grad_norm_(cross_attention_params, args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -987,7 +1098,7 @@ def main():
         if accelerator.is_main_process:
             if (
                 (args.val_image_url is not None)
-                and (args.validation_prompt is not None)
+                and (args.val_image_url2 is not None)
                 and (epoch % args.validation_epochs == 0)
             ):
                 if args.use_ema:
@@ -995,11 +1106,12 @@ def main():
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
                 # The models need unwrapping because for compatibility in distributed training mode.
-                pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
+                pipeline = StableDiffusionInstructPix2PixImagePipeline.from_pretrained(
+                    # args.pretrained_model_name_or_path,
+                    "paint-by-inpaint/add-base",
                     unet=unwrap_model(unet),
-                    #### text_encoder=unwrap_model(text_encoder),
-                    image_encoder=unwrap_model(image_encoder),
+                    # text_encoder=unwrap_model(text_encoder),
+                    image_encoder=unwrap_model(image_encoder), #aya to check
                     vae=unwrap_model(vae),
                     revision=args.revision,
                     variant=args.variant,
@@ -1026,16 +1138,19 @@ def main():
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
-        pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            ####text_encoder=unwrap_model(text_encoder),
-            image_encoder=unwrap_model(image_encoder),
+        pipeline = StableDiffusionInstructPix2PixImagePipeline.from_pretrained(
+            # args.pretrained_model_name_or_path,
+            "paint-by-inpaint/add-base",
+            # text_encoder=unwrap_model(text_encoder),
+            image_encoder=unwrap_model(image_encoder), #aya
             vae=unwrap_model(vae),
             unet=unwrap_model(unet),
             revision=args.revision,
             variant=args.variant,
         )
         pipeline.save_pretrained(args.output_dir)
+
+        torch.save(embedding_optimizer.state_dict(), os.path.join(args.output_dir, "emb_opt.pt"))
 
         if args.push_to_hub:
             upload_folder(
